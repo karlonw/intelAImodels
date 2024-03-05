@@ -75,6 +75,9 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 from torch.utils.data import Subset
 import math
+############## code changes ############
+import getpass
+########################################
 
 torch._C._jit_set_profiling_mode(False)
 torch._C._jit_set_profiling_executor(False)
@@ -89,9 +92,17 @@ final_top1_acc = 0.0
 final_top5_acc = 0.0
 
 cwd = os.path.dirname(os.path.abspath(__file__))
-hub = os.path.expanduser("~/.cache/torch/intel")
+user = getpass.getuser()
+sawmill = "/scratch2/" + user
+if os.path.exists(sawmill):
+    hub = os.path.expanduser(sawmill + "/.cache/torch/intel")
+else:
+    hub = os.path.expanduser("~/.cache/torch/intel")
+
 if not os.path.exists(hub):
     os.makedirs(hub, exist_ok=True)
+
+
 
 parser = argparse.ArgumentParser(description='PyTorch ImageNet Training')
 parser.add_argument('data', metavar='DIR', nargs='?', default='imagenet',
@@ -253,6 +264,9 @@ def main():
         print('use grad as bucket view: ', args.use_gradient_as_bucket_view)
         print('[info] --------------------------------------------------------')
 
+    ## kkw ##
+    args.xpu = 0
+
     if args.xpu is not None and args.gpu is not None:
         print('You need to choose running on NV GPU or XPU.')
         sys.exit()
@@ -313,14 +327,16 @@ def main():
                       'disable data parallelism.')
 
     if args.world_size == -1:
-        mpi_world_size = int(os.environ.get('PMI_SIZE', -1))
+        #mpi_world_size = int(os.environ.get('PMI_SIZE', -1))
+        mpi_world_size = int(os.environ.get('WORLD_SIZE', -1))
 
         if mpi_world_size > 0:
-            os.environ['MASTER_ADDR'] = args.dist_url #'127.0.0.1'
-            os.environ['MASTER_PORT'] = args.dist_port #'29500'
-            os.environ['RANK'] = os.environ.get('PMI_RANK', -1)
-            os.environ['WORLD_SIZE'] = os.environ.get('PMI_SIZE', -1)
-            args.rank = int(os.environ.get('PMI_RANK', -1))
+            #os.environ['MASTER_ADDR'] = args.dist_url #'127.0.0.1'
+            #os.environ['MASTER_PORT'] = args.dist_port #'29500'
+            #os.environ['RANK'] = os.environ.get('PMI_RANK', -1)
+            #os.environ['WORLD_SIZE'] = os.environ.get('PMI_SIZE', -1)
+            #args.rank = int(os.environ.get('PMI_RANK', -1))
+            args.rank = int(os.environ.get('RANK', -1))
         args.world_size = int(os.environ.get("WORLD_SIZE", -1))
     else: # mpich set
         if 'PMIX_RANK' in os.environ.keys(): # mpich set
@@ -334,16 +350,37 @@ def main():
 
     # 1 XPU card has 2 tile, and both are regarded as isolated devices/nodes
     ngpus_per_node = 1
-    if args.multiprocessing_distributed:
-        # Since we have ngpus_per_node processes per node, the total world_size
-        # needs to be adjusted accordingly
-        args.world_size = ngpus_per_node * args.world_size
-        # Use torch.multiprocessing.spawn to launch distributed processes: the
-        # main_worker process function
-        mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
-    else:
-        # Simply call main_worker function
-        main_worker(ngpus_per_node, args)
+    #if args.multiprocessing_distributed:
+    #    # Since we have ngpus_per_node processes per node, the total world_size
+    #    # needs to be adjusted accordingly
+    #    args.world_size = ngpus_per_node * args.world_size
+    #    # Use torch.multiprocessing.spawn to launch distributed processes: the
+    #    # main_worker process function
+    #    mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    #else:
+    #    # Simply call main_worker function
+    #    main_worker(ngpus_per_node, args)
+
+    env_dict = {
+        key: os.environ[key]
+        for key in ("MASTER_ADDR", "MASTER_PORT", "RANK", "WORLD_SIZE")
+    }
+
+    print(f"[{os.getpid()}] Initializing process group with: {env_dict}", flush=True)
+    dist.init_process_group(backend="ccl")
+
+    print(
+        f"[{os.getpid()}]: world_size = {dist.get_world_size()}, "
+        + f"rank = {dist.get_rank()}, backend={dist.get_backend()} \n", end='', flush=True
+    )
+
+    #mp.spawn(main_worker, nprocs=ngpus_per_node, args=(ngpus_per_node, args))
+    main_worker(int(os.environ['SLURM_NTASKS_PER_NODE']), args)
+
+    print('finished train', flush=True)
+
+    # Tear down the process group
+    dist.destroy_process_group()
 
 def jit_calib(model, val_loader_calib, args):
     print('doing int8 jit calibration')
@@ -400,13 +437,13 @@ def main_worker(ngpus_per_node, args):
     if args.distributed:
         if args.rank == -1:
             args.rank = int(os.environ["RANK"])
-        if args.multiprocessing_distributed:
-            # For multiprocessing distributed training, rank needs to be the
-            # global rank among all the processes
-            args.rank = args.rank * ngpus_per_node + args.gpu
-        init_method = 'tcp://' + args.dist_url + ':' + args.dist_port
-        dist.init_process_group(backend=args.dist_backend, init_method=init_method,
-                                world_size=args.world_size, rank=args.rank)
+        # if args.multiprocessing_distributed:
+        #     # For multiprocessing distributed training, rank needs to be the
+        #     # global rank among all the processes
+        #     args.rank = args.rank * ngpus_per_node + args.gpu
+        # init_method = 'tcp://' + args.dist_url + ':' + args.dist_port
+        # dist.init_process_group(backend=args.dist_backend, init_method=init_method,
+        #                         world_size=args.world_size, rank=args.rank)
 
         if args.gpu is not None:
             args.gpu = args.rank
@@ -416,7 +453,8 @@ def main_worker(ngpus_per_node, args):
             elif 'OMPI_COMM_WORLD_LOCAL_RANK' in os.environ.keys():
                 local_rank = os.environ['OMPI_COMM_WORLD_LOCAL_RANK']
             else: # mpich set
-                local_rank = os.environ['PALS_LOCAL_RANKID']
+                #local_rank = os.environ['PALS_LOCAL_RANKID']
+                local_rank = os.environ['SLURM_LOCALID']
             args.xpu = local_rank
             print('world_size:{}, rank:{}, local_rank:{}'.format(args.world_size, args.rank, local_rank))
 
@@ -755,7 +793,7 @@ def train(train_loader, model, criterion, optimizer, epoch, profiling, use_autoc
             output = model(images)
             loss = criterion(output, target)
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss.backward(retain_graph=True)
         if args.lars:
             # Update LR for Lars
             MLPerfLRScheduler(optimizer, global_num_iter, len(train_loader), args)
@@ -852,7 +890,7 @@ def train(train_loader, model, criterion, optimizer, epoch, profiling, use_autoc
 
                 # compute gradient and do SGD step
                 optimizer.zero_grad()
-                loss.backward()
+                loss.backward(retain_graph=True)
                 optimizer.step()
 
                 # D2H, as sync
